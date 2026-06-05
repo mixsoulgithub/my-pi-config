@@ -1,0 +1,10 @@
+{
+  "name": "my-pi-config",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Personal pi coding agent configuration — Emacs-style Ctrl+X prefix keybindings",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions"]
+  }
+}
