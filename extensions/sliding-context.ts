@@ -1,11 +1,13 @@
 /**
- * Sliding Context v2 — Summarize middle turns, keep head + summary + tail.
+ * Sliding Context v2 — Summarize middle turns, preserve prompt cache.
  *
  * How it works:
  * 1. On `turn_end`: when middle turns exceed threshold, summarize the new ones
- *    using the same model (or a cheaper one) via `complete()`.
+ *    using the active model via `complete()`.
  * 2. Summary is stored as a custom entry in the session.
- * 3. On `context`: the LLM sees head + summary + tail.
+ * 3. On `context`: the LLM sees head → tail → summary (cache-friendly ordering).
+ *    Summary is at the END so when it grows, head+tail positions don't shift
+ *    and Anthropic's prompt cache stays valid.
  * 4. On `session_start`: restore the running summary from session.
  *
  * Full history stays on disk for /tree, /fork, etc.
@@ -177,6 +179,11 @@ Write the summary in plain paragraphs (no markdown headings).`,
   });
 
   // ── Filter what the LLM sees ──────────────────────────────────────
+  //
+  // Cache-friendly ordering: head → tail → summary
+  // The summary is appended at the END so when it grows, nothing shifts
+  // position and Anthropic's prompt cache stays valid for head+tail.
+  //
   pi.on("context", async (event) => {
     const messages = event.messages;
     if (messages.length === 0) return;
@@ -191,32 +198,32 @@ Write the summary in plain paragraphs (no markdown headings).`,
 
     const headCutoff = ts[headEnd] ?? messages.length;
 
-    // Build filtered view: head + summary + tail
+    // Build filtered view: head → tail → summary
     const filtered: typeof messages = [];
 
-    // Head
+    // Head (fixed position → always cached)
     for (let i = 0; i < headCutoff; i++) {
       filtered.push(messages[i]!);
     }
 
-    // Running summary (inserted as a synthetic user message)
+    // Tail (fixed position → always cached, because summary is after tail)
+    const tailCutoff = ts[tailStart] ?? messages.length;
+    for (let i = tailCutoff; i < messages.length; i++) {
+      filtered.push(messages[i]!);
+    }
+
+    // Summary goes at the END — when it grows, nothing after it shifts
     if (runningSummary) {
       filtered.push({
         role: "user",
         content: [
           {
             type: "text",
-            text: `[Summary of previous ${tailStart - headEnd} turns:]\n${runningSummary}`,
+            text: `[Summary of ${tailStart - headEnd} turns between the first and last turns shown above:]\n${runningSummary}`,
           },
         ],
         timestamp: Date.now(),
       } as any);
-    }
-
-    // Tail
-    const tailCutoff = ts[tailStart] ?? messages.length;
-    for (let i = tailCutoff; i < messages.length; i++) {
-      filtered.push(messages[i]!);
     }
 
     return { messages: filtered };
