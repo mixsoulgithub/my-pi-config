@@ -1,29 +1,37 @@
 /**
- * Sliding Context — Keep only head + tail of conversation, drop the middle.
+ * Sliding Context v2 — Summarize middle turns, keep head + summary + tail.
  *
- * Simple v1: non-destructive filtering via the `context` event.
- * The LLM sees only the first turn + last N turns. Everything between is dropped.
+ * How it works:
+ * 1. On `turn_end`: when middle turns exceed threshold, summarize the new ones
+ *    using the same model (or a cheaper one) via `complete()`.
+ * 2. Summary is stored as a custom entry in the session.
+ * 3. On `context`: the LLM sees head + summary + tail.
+ * 4. On `session_start`: restore the running summary from session.
+ *
  * Full history stays on disk for /tree, /fork, etc.
- *
- * v2 (later): auto-summarize the middle instead of dropping it entirely.
  *
  * Config in ~/.pi/agent/settings.json:
  *   { "slidingContext": { "headTurns": 1, "tailTurns": 3 } }
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { complete } from "@earendil-works/pi-ai";
+import {
+  type ExtensionAPI,
+  convertToLlm,
+  serializeConversation,
+} from "@earendil-works/pi-coding-agent";
+import type { Message } from "@earendil-works/pi-ai";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 interface SlidingConfig {
-  /** How many initial user→assistant turns to keep verbatim (default 1) */
   headTurns: number;
-  /** How many recent user→assistant turns to keep verbatim (default 3) */
   tailTurns: number;
 }
 
 const DEFAULTS: SlidingConfig = { headTurns: 1, tailTurns: 3 };
+const CUSTOM_TYPE = "sliding-context-summary";
 
 function loadConfig(cwd: string): SlidingConfig {
   const sources = [
@@ -40,73 +48,177 @@ function loadConfig(cwd: string): SlidingConfig {
           tailTurns: typeof cfg.tailTurns === "number" ? cfg.tailTurns : DEFAULTS.tailTurns,
         };
       }
-    } catch { /* file missing or invalid, try next */ }
+    } catch { /* skip */ }
   }
   return DEFAULTS;
 }
 
+/** Find indices of user messages (turn starts) in a message array */
+function turnStarts(msgs: Message[]): number[] {
+  const starts: number[] = [];
+  for (let i = 0; i < msgs.length; i++) {
+    if (msgs[i]!.role === "user") starts.push(i);
+  }
+  return starts;
+}
+
 export default function (pi: ExtensionAPI) {
   let config = DEFAULTS;
+  /** Running summary text, restored from session on start */
+  let runningSummary = "";
 
+  // ── Restore summary from session ──────────────────────────────────
   pi.on("session_start", (_event, ctx) => {
     config = loadConfig(ctx.cwd);
-    ctx.ui.setStatus("sliding-context", `ctx: h${config.headTurns}/t${config.tailTurns}`);
+    runningSummary = "";
+    for (const entry of ctx.sessionManager.getEntries()) {
+      if (entry.type === "custom" && entry.customType === CUSTOM_TYPE) {
+        runningSummary = (entry.data?.summary as string) ?? "";
+      }
+    }
+    ctx.ui.setStatus("sliding-context", `sum: ${runningSummary ? "✓" : "—"} h${config.headTurns}/t${config.tailTurns}`);
   });
 
+  // ── After each turn, summarize new middle entries ─────────────────
+  pi.on("turn_end", async (event, ctx) => {
+    const entries = ctx.sessionManager.getEntries();
+    const ts = turnStarts(entries as unknown as Message[]);
+
+    const totalTurns = ts.length;
+    const keep = config.headTurns + config.tailTurns;
+    if (totalTurns <= keep + 1) return; // too small, skip
+
+    const headEnd = Math.min(config.headTurns, totalTurns);
+    const tailStart = Math.max(headEnd, totalTurns - config.tailTurns);
+
+    // Extract messages from entries for summarization
+    const middleMessages = entries
+      .slice(ts[headEnd]!, ts[tailStart]!)
+      .filter((e) => e.type === "message")
+      .map((e) => (e as any).message);
+    if (middleMessages.length === 0) return;
+
+    // Only summarize if there are actual assistant messages
+    const hasNewContent = middleMessages.some(
+      (m: any) => m.role === "assistant",
+    );
+    if (!hasNewContent) return;
+
+    // Use the active model for summarization
+    const model = ctx.model;
+    if (!model) return;
+
+    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+    if (!auth.ok || !auth.apiKey) {
+      ctx.ui.notify("sliding-context: no API key for summarization", "warning");
+      return;
+    }
+
+    ctx.ui.notify(
+      `sliding-context: summarizing ${middleMessages.length} middle messages…`,
+      "info",
+    );
+
+    const conversationText = serializeConversation(
+      convertToLlm(middleMessages),
+    );
+
+    const previousCtx = runningSummary
+      ? `\nPrevious summary for continuity:\n${runningSummary}\n`
+      : "";
+
+    const summaryMessages = [
+      {
+        role: "user" as const,
+        content: [
+          {
+            type: "text" as const,
+            text: `Summarize this conversation segment concisely. Focus on:
+- Key decisions, code changes, and their rationale
+- Current state of work and open issues
+- Next steps planned${previousCtx}
+
+${conversationText}
+
+Write the summary in plain paragraphs (no markdown headings).`,
+          },
+        ],
+        timestamp: Date.now(),
+      },
+    ];
+
+    try {
+      const response = await complete(model, { messages: summaryMessages }, {
+        apiKey: auth.apiKey,
+        headers: auth.headers,
+        maxTokens: 4096,
+      });
+
+      const newSummary = response.content
+        .filter((c): c is { type: "text"; text: string } => c.type === "text")
+        .map((c) => c.text)
+        .join("\n");
+
+      if (!newSummary.trim()) return;
+
+      // Append to running summary
+      runningSummary = runningSummary
+        ? `${runningSummary}\n\n---\n\n${newSummary}`
+        : newSummary;
+
+      // Persist in session (non-destructive — never touches LLM context)
+      pi.appendEntry(CUSTOM_TYPE, { summary: runningSummary });
+
+      ctx.ui.setStatus("sliding-context", `sum: ✓ h${config.headTurns}/t${config.tailTurns}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      ctx.ui.notify(`sliding-context: ${msg}`, "error");
+    }
+  });
+
+  // ── Filter what the LLM sees ──────────────────────────────────────
   pi.on("context", async (event) => {
     const messages = event.messages;
     if (messages.length === 0) return;
 
-    // Find turn boundaries (user messages start a new turn)
-    const turnStarts: number[] = [];
-    for (let i = 0; i < messages.length; i++) {
-      if (messages[i]!.role === "user") {
-        turnStarts.push(i);
-      }
-    }
-
-    const totalTurns = turnStarts.length;
+    const ts = turnStarts(messages);
+    const totalTurns = ts.length;
     const keep = config.headTurns + config.tailTurns;
+    if (totalTurns <= keep + 1) return;
 
-    // Small conversation — keep everything
-    if (totalTurns <= keep + 1) return; // +1 for some slack
-
-    // Which turns to keep
     const headEnd = Math.min(config.headTurns, totalTurns);
     const tailStart = Math.max(headEnd, totalTurns - config.tailTurns);
 
-    // Build filtered messages
-    const kept: typeof messages = [];
+    const headCutoff = ts[headEnd] ?? messages.length;
 
-    // Head: messages from turn 0 up to (but not including) tailStart
-    const headCutoff = turnStarts[headEnd] ?? messages.length;
+    // Build filtered view: head + summary + tail
+    const filtered: typeof messages = [];
+
+    // Head
     for (let i = 0; i < headCutoff; i++) {
-      kept.push(messages[i]!);
+      filtered.push(messages[i]!);
     }
 
-    // Gap marker (helps the LLM understand context was dropped)
-    if (headEnd < tailStart) {
-      const droppedTurns = tailStart - headEnd;
-      kept.push({
+    // Running summary (inserted as a synthetic user message)
+    if (runningSummary) {
+      filtered.push({
         role: "user",
         content: [
           {
             type: "text",
-            text: `[${droppedTurns} earlier turns omitted — ` +
-              `keeping first ${config.headTurns} and last ${config.tailTurns} of ${totalTurns} total turns]`,
+            text: `[Summary of previous ${tailStart - headEnd} turns:]\n${runningSummary}`,
           },
         ],
         timestamp: Date.now(),
       } as any);
     }
 
-    // Tail: everything from tailStart onward
-    const tailCutoff = turnStarts[tailStart] ?? messages.length;
+    // Tail
+    const tailCutoff = ts[tailStart] ?? messages.length;
     for (let i = tailCutoff; i < messages.length; i++) {
-      kept.push(messages[i]!);
+      filtered.push(messages[i]!);
     }
 
-    return { messages: kept };
+    return { messages: filtered };
   });
-
 }
