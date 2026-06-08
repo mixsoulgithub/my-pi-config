@@ -5,6 +5,7 @@
   "description": "Personal pi coding agent configuration — Emacs-style Ctrl+X prefix keybindings",
   "keywords": ["pi-package"],
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": ["./extensions"],
+    "skills": ["./skills"]
   }
 }
