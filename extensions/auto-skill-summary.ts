@@ -123,21 +123,21 @@ export default function (pi: ExtensionAPI) {
         const choice = await ctx.ui.select(
             `Turn ${turnCount}${modeTag} -- Summarize skills?`,
             [
-                { value: "yes", label: "[Y] Summarize now" },
-                { value: "delay5", label: "[5] Remind in 5 turns" },
-                { value: "delay10", label: "[10] Remind in 10 turns" },
-                { value: "no", label: "[X] Skip this session" },
+                "[Y] Summarize now",
+                "[5] Remind in 5 turns",
+                "[10] Remind in 10 turns",
+                "[X] Skip this session",
             ],
         );
 
         switch (choice) {
-            case "yes": {
+            case "[Y] Summarize now": {
                 lastSummaryTurn = turnCount;
                 ctx.ui.notify("Triggering skill summary...", "info");
                 pi.sendUserMessage("/skill:summarize-skill");
                 break;
             }
-            case "delay5": {
+            case "[5] Remind in 5 turns": {
                 delayUntil = turnCount + 5;
                 ctx.ui.notify(
                     `Delayed 5 turns -- will remind at turn ${delayUntil}`,
@@ -145,7 +145,7 @@ export default function (pi: ExtensionAPI) {
                 );
                 break;
             }
-            case "delay10": {
+            case "[10] Remind in 10 turns": {
                 delayUntil = turnCount + 10;
                 ctx.ui.notify(
                     `Delayed 10 turns -- will remind at turn ${delayUntil}`,
@@ -153,8 +153,7 @@ export default function (pi: ExtensionAPI) {
                 );
                 break;
             }
-            case "no": {
-                // Disable for rest of session
+            case "[X] Skip this session": {
                 delayUntil = Infinity;
                 ctx.ui.notify(
                     "Skill-summary reminders disabled for this session. Use /auto-summary-toggle to re-enable.",
