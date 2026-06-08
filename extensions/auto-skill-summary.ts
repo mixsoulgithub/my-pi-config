@@ -15,6 +15,9 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
@@ -75,6 +78,119 @@ export default function (pi: ExtensionAPI) {
             lastReminderTurn = turnCount;
             if (ctx.hasUI) ctx.ui.notify("Triggering skill summary...", "info");
             pi.sendUserMessage("/skill:summarize-skill");
+        },
+    });
+
+    // ── Tool: review skill summaries ─────────────────────────────────────
+    pi.registerTool({
+        name: "review_skill_summaries",
+        label: "Review Summaries",
+        description:
+            "Review generated skill summary files. Shows each file to the user with [Y] Accept / [E] Edit / [R] Reject options. Call this after writing summary files.",
+        parameters: Type.Object({
+            summaryDir: Type.String({
+                description:
+                    "Absolute path to the date directory containing summary files, e.g. ~/projects/my-pi-config/skills/summaries/2026-06-08/",
+            }),
+        }),
+        async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+            const dir = params.summaryDir.replace(/^~/, process.env.HOME || "/root");
+            if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+                return {
+                    content: [{ type: "text", text: `Directory not found: ${dir}` }],
+                    details: {},
+                    isError: true,
+                };
+            }
+
+            const files = fs
+                .readdirSync(dir)
+                .filter((f) => f.endsWith(".md") && f !== "INDEX.md")
+                .sort();
+
+            if (files.length === 0) {
+                return {
+                    content: [{ type: "text", text: `No .md files found in ${dir}` }],
+                    details: {},
+                };
+            }
+
+            const accepted: string[] = [];
+            const edited: string[] = [];
+            const rejected: string[] = [];
+
+            for (const file of files) {
+                const filePath = path.join(dir, file);
+                const content = fs.readFileSync(filePath, "utf-8");
+                const words = content.split(/\s+/).filter(Boolean).length;
+
+                // Extract first heading as topic hint
+                const headingMatch = content.match(/^# (.+)$/m);
+                const topic = headingMatch ? headingMatch[1] : "(no heading)";
+
+                // Show file info and wait for user choice
+                const choice = await ctx.ui.select(
+                    `Review: ${file} (${words}w) — ${topic}`,
+                    [
+                        "[Y] Accept",
+                        "[E] Edit",
+                        "[R] Reject",
+                    ],
+                );
+
+                switch (choice) {
+                    case "[Y] Accept":
+                        accepted.push(file);
+                        ctx.ui.notify(`Accepted: ${file}`, "info");
+                        break;
+
+                    case "[E] Edit": {
+                        // Ask user what to change
+                        const editPrompt = await ctx.ui.input(
+                            `Edit ${file} — describe what to change:`,
+                        );
+                        if (!editPrompt) {
+                            accepted.push(file); // empty = keep as-is
+                            ctx.ui.notify(`Kept as-is: ${file}`, "info");
+                            break;
+                        }
+                        // Queue an agent turn to apply the edit
+                        pi.sendUserMessage(
+                            `Edit the skill file ${filePath} according to: ${editPrompt}\n\n` +
+                            `After editing, re-run validation, then tell me you're done.`,
+                            { deliverAs: "followUp" },
+                        );
+                        edited.push(file);
+                        ctx.ui.notify(`Edit queued for: ${file}`, "info");
+                        break;
+                    }
+
+                    case "[R] Reject":
+                        fs.unlinkSync(filePath);
+                        rejected.push(file);
+                        ctx.ui.notify(`Rejected: ${file}`, "warning");
+                        break;
+                }
+            }
+
+            // Build result message
+            const lines: string[] = ["Skill summary review complete."];
+            if (accepted.length) lines.push(`Accepted: ${accepted.join(", ")}`);
+            if (edited.length) lines.push(`Edited (queued): ${edited.join(", ")}`);
+            if (rejected.length) lines.push(`Rejected: ${rejected.join(", ")}`);
+
+            // If any accepted, suggest git commit
+            if (accepted.length > 0) {
+                lines.push(
+                    `\nTo commit accepted files:\n` +
+                    `  cd ~/projects/my-pi-config && git add skills/summaries/ && git commit -m "skill-summary: ${accepted.join(", ")}"`,
+                );
+            }
+
+            return {
+                content: [{ type: "text", text: lines.join("\n") }],
+                details: { dir, accepted, edited, rejected },
+            };
         },
     });
 
